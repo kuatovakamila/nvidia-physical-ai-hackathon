@@ -55,10 +55,30 @@ PARKED = (0.0, -0.9, 0.0)  # where unused blocks go: out of frame, out of reach
 
 MEDICINE_R, CUP_R, WATER_R = 0.018, 0.030, 0.030
 
+CAM_EYE = (0.75, 0.75, 0.55)
+CAM_TARGET = (0.20, 0.0, 0.05)
+
 
 def _zone_center():
     xmin, xmax, ymin, ymax = ZONE
     return ((xmin + xmax) / 2, (ymin + ymax) / 2)
+
+
+def _publish_frame(world, logger, tag: str) -> bool:
+    """Step once with rendering, capture, and publish if exposure is sane.
+    Returns whether a frame was actually published, so callers can keep a
+    running count without duplicating the exposure check."""
+    import numpy as np
+
+    world.step(render=True)
+    frame = antioch.capture_viewport()
+    if frame is None:
+        return False
+    rgb = np.asarray(frame)[:, :, :3]
+    if not (10.0 <= float(rgb.mean()) <= 220.0):
+        return False
+    logger.image(f"camera/{tag}", rgb)
+    return True
 
 
 def _set_translate(stage, prim_path: str, pos) -> None:
@@ -174,6 +194,8 @@ class SimBackend(ArmBackend):
             "obj_speed": 0.0,
             # Set per goal by run_goal(): where THIS goal was told to put its
             # object. ZONE is only the fallback and the final delivery test.
+            # (Same fix as origin/main's zone_of map, kept on the executor side
+            # so RealBackend and FakeBackend inherit it too.)
             "zone_rect": getattr(self, "place_zone", None) or ZONE,
             # Not the table surface but this object's RESTING centroid height:
             # the lift gate asks "did it come off the table", and that is the
@@ -275,6 +297,7 @@ def kitchen(
 
     from isaacsim.core.api.robots import Robot
     from isaacsim.core.utils.prims import create_prim
+    from isaacsim.core.utils.viewports import set_camera_view
 
     rng = random.Random(seed)
 
@@ -287,7 +310,8 @@ def kitchen(
     antioch.load_asset(BLOCKS, prim_path="/World/blocks", version="1.0.0")
     robot = world.scene.add(Robot(prim_path="/World/SO101", name="so101"))
     world.reset()
-    antioch.capture_viewport()  # spend the pre-scene frame
+    antioch.capture_viewport()  # spend the pre-scene (black) frame
+    set_camera_view(eye=list(CAM_EYE), target=list(CAM_TARGET), camera_prim_path="/OmniverseKit_Persp")
 
     stage = antioch.stage()
     prim_of = {role: f"/World/blocks/{mesh}/{mesh}" for role, mesh in ROLES.items()}
@@ -302,7 +326,12 @@ def kitchen(
     logger.info(f"resting centroid heights: {backend.rest_z}")
 
     results = []
+    published_frames = 0
     for ep in range(episodes):
+        # Publishing costs a render + a viewport read; keep the scenario fast
+        # by only capturing the one episode that best demonstrates the loop.
+        capture_ep = ep == 0
+        captured = {"blocker": False, "grasp_fail": False, "retry": False}
         scene = _randomize(rng, blocked=rng.random() < blocker_rate)
         by_name = {o.name: o for o in scene}
         for role in prim_of:
@@ -320,15 +349,20 @@ def kitchen(
         goals, guard = [], 0
         while (g := plan.next_action()) is not None and guard < 8:
             guard += 1
-            # Keyed on (seed, episode, object, attempt) rather than drawn from
-            # a stream, so supervisor-on and supervisor-off face an identical
-            # sequence of manufactured failures no matter how many goals each
-            # one issues. Applying it to EVERY first grasp instead made the
-            # naive baseline fail by construction — a tautology, not a result.
-            biased = random.Random(
+            # Two constraints, both needed. The failure studies MEDICINE's
+            # recovery path, so it must not also sabotage blocker relocation,
+            # which has nothing to do with the bias study. And it fires only
+            # some of the time: applied to every first grasp it made the naive
+            # baseline fail by construction, which is a tautology rather than a
+            # measurement. The draw is keyed on (seed, episode, object,
+            # attempt) rather than taken from a stream, so both arms of the
+            # study face an identical sequence of manufactured failures no
+            # matter how many goals each one issues.
+            is_medicine = g.obj == "medicine"
+            biased = is_medicine and random.Random(
                 f"{seed}|{ep}|{g.obj}|{g.attempts}"
             ).random() < bias_rate
-            bias = bias_mm / 1000.0 if (g.attempts == 0 and biased) else 0.0
+            bias = bias_mm / 1000.0 if (biased and g.attempts == 0) else 0.0
             target = by_name[g.obj]
             grip_z = backend.rest_z[g.obj]
             rep = run_goal(
@@ -345,6 +379,20 @@ def kitchen(
                 "failed_phase": rep.failed_phase, "unreachable": rep.unreachable,
                 "event": rep.event.kind if rep.event else None, "biased": biased,
             })
+
+            if capture_ep:
+                if not is_medicine and not captured["blocker"]:
+                    captured["blocker"] = _publish_frame(world, logger, "blocker_relocation")
+                    published_frames += captured["blocker"]
+                elif is_medicine and not rep.ok and not captured["grasp_fail"]:
+                    captured["grasp_fail"] = _publish_frame(world, logger, "medicine_grasp_biased")
+                    published_frames += captured["grasp_fail"]
+                elif is_medicine and rep.ok and not captured["retry"]:
+                    captured["retry"] = _publish_frame(world, logger, "medicine_retry_success")
+                    published_frames += captured["retry"]
+
+        if capture_ep:
+            published_frames += _publish_frame(world, logger, "final_placement")
 
         mx, my, _mz = backend.centre_of("medicine")
         delivered = ZONE[0] <= mx <= ZONE[1] and ZONE[2] <= my <= ZONE[3]
@@ -381,6 +429,7 @@ def kitchen(
         "relocations": sum(
             1 for r in results for gl in r["goals"] if gl["reason"] != "user"
         ),
+        "review_frames": published_frames,
         "episodes_detail": results,
     })
     # A check gates the VALIDITY of the experiment, not the desirability of its
@@ -402,6 +451,11 @@ def kitchen(
         "blocked scenes were actually staged",
         blocked_n > 0 or blocker_rate == 0.0,
         detail=f"{blocked_n}/{n} episodes had a blocker",
+    )
+    run.check(
+        "the scene published a usable review frame",
+        published_frames > 0,
+        detail=f"{published_frames} frames passed the exposure gate",
     )
     if supervisor_on:
         # The claim itself, asserted only where it is a claim.
