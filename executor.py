@@ -31,7 +31,7 @@ from arm_ik import (
     Pose,
     Unreachable,
     forward,
-    inverse,
+    solve,
     to_vector,
 )
 from monitor import Event, monitor
@@ -203,7 +203,9 @@ def run_goal(backend: ArmBackend, obj_name: str, pick_xyz, place_xyz,
     ran = 0
     for wp in waypoints:
         try:
-            q = inverse(wp.pose)
+            # solve(), not inverse(): it keeps the approach as vertical as the
+            # geometry allows instead of demanding vertical and giving up.
+            q = solve(wp.pose.x, wp.pose.y, wp.pose.z, wp.pose.pitch)
         except Unreachable as exc:
             # Refusing to move beats moving somewhere wrong: the planner can
             # pick another spot, but it cannot undo a swipe across the table.

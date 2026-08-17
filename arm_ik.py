@@ -98,10 +98,32 @@ def forward(q: dict[str, float]) -> tuple[float, float, float]:
     )
 
 
-def inverse(pose: Pose, elbow_up: bool = True) -> dict[str, float]:
-    """Closed-form IK. Raises Unreachable rather than returning a bent pose
-    that silently misses — a planner that thinks it commanded a grasp and did
-    not is the worst failure mode we can build."""
+def inverse(pose: Pose, elbow_up: bool | None = None) -> dict[str, float]:
+    """Closed-form IK, trying both elbow branches unless one is demanded.
+
+    A two-link solve always has two mirror solutions, and near the base the
+    elbow-up one folds past the -100 deg joint limit while elbow-down sits
+    comfortably inside it. Solving only one branch therefore reports perfectly
+    reachable points as unreachable — measured: every blocker position in the
+    home->medicine corridor, which is exactly where blockers belong, so the
+    whole relocation path silently never ran.
+
+    Raises Unreachable rather than returning a bent pose that silently misses:
+    a planner that thinks it commanded a grasp and did not is the worst failure
+    mode we can build.
+    """
+    branches = (True, False) if elbow_up is None else (elbow_up,)
+    last: Unreachable | None = None
+    for branch in branches:
+        try:
+            return _solve(pose, branch)
+        except Unreachable as exc:
+            last = exc
+    raise last if last else Unreachable("no branch attempted")
+
+
+def _solve(pose: Pose, elbow_up: bool) -> dict[str, float]:
+    """One elbow branch of the closed-form solve."""
     dx = pose.x - SHOULDER_X
     dy = pose.y - SHOULDER_Y
     yaw = math.atan2(dy, dx)
@@ -158,11 +180,45 @@ def inverse(pose: Pose, elbow_up: bool = True) -> dict[str, float]:
     return q
 
 
+MAX_TILT = math.radians(55)     # how far off vertical a grasp may lean
+TILT_STEP = math.radians(5)
+
+
+def solve(x: float, y: float, z: float, prefer_pitch: float = -math.pi / 2,
+          max_tilt: float = MAX_TILT) -> dict[str, float]:
+    """Joint targets for a grasp point, relaxing the tool tilt only as needed.
+
+    Demanding a straight-down approach everywhere is what makes close-in points
+    look unreachable: at 0.17 m from the base a vertical grasp needs 118 deg of
+    elbow and the joint stops at 90. A real arm leans into those points, so we
+    try vertical first and tilt outward in 5 deg steps until something fits —
+    the pose stays as upright as the geometry allows, which is what keeps a
+    vial from being tipped.
+
+    Measured consequence: without this, every blocker in the home->medicine
+    corridor was rejected and the relocation path never ran at all.
+    """
+    attempts = [prefer_pitch]
+    k = TILT_STEP
+    while k <= max_tilt + 1e-9:
+        attempts.append(prefer_pitch + k)   # lean toward horizontal
+        attempts.append(prefer_pitch - k)
+        k += TILT_STEP
+
+    last: Unreachable | None = None
+    for pitch in attempts:
+        try:
+            return inverse(Pose(x, y, z, pitch))
+        except Unreachable as exc:
+            last = exc
+    raise last if last else Unreachable("no tilt attempted")
+
+
 def reachable(x: float, y: float, z: float, pitch: float = -math.pi / 2) -> bool:
     """Cheap predicate for the planner's free-spot sampler: never propose a
     parking spot the arm cannot actually visit."""
     try:
-        inverse(Pose(x, y, z, pitch))
+        solve(x, y, z, pitch)
         return True
     except Unreachable:
         return False

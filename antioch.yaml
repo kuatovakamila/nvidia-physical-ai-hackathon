@@ -1,7 +1,7 @@
 # The id is the immutable identity used by Antioch machines.
 id: "interx-p-ai-hackathon-a812560b8e86455aa12f9e0a5210e013"
 name: "interX-p-ai-hackathon"
-scenario_paths: ["src/scenarios.py", "src/probe.py"]
+scenario_paths: ["src/scenarios.py", "src/probe.py", "src/kitchen.py"]
 
 services:
   sim:
