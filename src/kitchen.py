@@ -327,13 +327,23 @@ def kitchen(
 
     results = []
     published_frames = 0
+    capture_done = False
     for ep in range(episodes):
-        # Publishing costs a render + a viewport read; keep the scenario fast
-        # by only capturing the one episode that best demonstrates the loop.
-        capture_ep = ep == 0
         captured = {"blocker": False, "grasp_fail": False, "retry": False}
         scene = _randomize(rng, blocked=rng.random() < blocker_rate)
         by_name = {o.name: o for o in scene}
+        # Publishing costs a render and a viewport read, so only one episode is
+        # captured — and it has to be a BLOCKED one. Episode 0 is whatever the
+        # seed dealt: on seed 0 it is an unobstructed pick that succeeds first
+        # try, which published two frames of nothing worth looking at. The
+        # frames are the evidence that the robot relocated the blocker on its
+        # own, so they must come from an episode where it did. Falling back to
+        # the last episode keeps a zero-blocker configuration from publishing
+        # nothing at all.
+        capture_ep = not capture_done and (
+            "cup" in by_name or ep == episodes - 1
+        )
+        capture_done = capture_done or capture_ep
         for role in prim_of:
             o = by_name.get(role)
             if o:
