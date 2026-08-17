@@ -1,0 +1,12 @@
+.git
+.antioch
+.venv
+.uv-cache
+__pycache__
+*.pyc
+.mypy_cache
+.pytest_cache
+home/
+.cache/
+outputs/
+output

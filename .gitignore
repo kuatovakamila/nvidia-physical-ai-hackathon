@@ -1,0 +1,7 @@
+# Local Antioch state and environment caches
+.antioch/
+.venv/
+.uv-cache/
+__pycache__/
+.mypy_cache/
+.pytest_cache/
