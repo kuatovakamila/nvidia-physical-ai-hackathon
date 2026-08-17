@@ -103,6 +103,7 @@ class Planner:
     """
     MAX_ATTEMPTS = 2       # retries per goal after a failure event
     MAX_EXPANSIONS = 2     # blocker-goals we will spawn per goal (loop guard)
+    MAX_DEPTH = 3          # how deep the "clear the blocker" chain may nest
 
     def __init__(self, scene: dict[str, Obj],
                  table_bounds: tuple[float, float, float, float],
@@ -128,7 +129,19 @@ class Planner:
             target = self.scene[g.obj]
             blockers = find_blockers(target, list(self.scene.values()),
                                      self.home, goal_xy=g.to_xy, anchor=g.anchor)
-            if not blockers or g.expansions >= self.MAX_EXPANSIONS:
+            # Two objects can each sit in the other's corridor, and relocating
+            # one puts it back in the way of the other. MAX_EXPANSIONS cannot
+            # catch that: it is counted per Goal, and every expansion mints a
+            # fresh Goal with the counter back at zero, so the chain
+            # "clear A -> clear B -> clear A" nests forever. Measured: this
+            # hung the whole episode loop with no error, in pure Python.
+            # Anything already queued is therefore not a blocker worth chasing,
+            # and the chain is capped outright.
+            pending = {q.obj for q in self.stack}
+            blockers = [b for b in blockers if b.name not in pending]
+            if (not blockers
+                    or g.expansions >= self.MAX_EXPANSIONS
+                    or len(self.stack) >= self.MAX_DEPTH):
                 return self.stack.pop()
             b = blockers[0]
             mx, my = (self.home[0] + target.x) / 2, (self.home[1] + target.y) / 2
@@ -187,3 +200,22 @@ if __name__ == "__main__":
         print(" ", line)
     assert step == 3, "expected exactly: relocate cup, then move medicine"
     print("\nself-test OK: the robot decided to move the cup on its own.")
+
+    # Regression: mutually-blocking objects must not nest forever. Two blocks
+    # sitting on top of each other's corridors is the natural way to trigger
+    # it, and before MAX_DEPTH this loop never returned at all.
+    tight = {
+        "medicine": Obj("medicine", 0.24, -0.05, 0.018),
+        "cup":      Obj("cup",      0.17, -0.03, 0.030),
+        "water":    Obj("water",    0.16, 0.12, 0.030),
+    }
+    p2 = Planner(tight, table_bounds=(0.135, 0.270, -0.160, 0.160),
+                 gripper_home=(0.075, 0.0))
+    p2.request("medicine", (0.19, 0.10), anchor="water")
+    issued = 0
+    while (g := p2.next_action()) is not None and issued < 20:
+        issued += 1
+        p2.on_result(g, success=True, new_pose=g.to_xy)
+    assert issued < 20, "goal stack failed to terminate on mutual blockers"
+    print(f"cycle guard OK: terminated after {issued} goals, depth cap "
+          f"{Planner.MAX_DEPTH}")

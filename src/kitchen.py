@@ -26,8 +26,8 @@ import random
 import antioch
 
 from arm_ik import JOINT_ORDER, forward, reachable
-from executor import ArmBackend, run_goal
-from planner import Obj, Planner
+from executor import SWEEP_HALFWIDTH, ArmBackend, run_goal
+from planner import Obj, Planner, dist_point_segment
 
 logger = antioch.Logger("kitchen")
 
@@ -100,7 +100,9 @@ class SimBackend(ArmBackend):
     rest of the file never has to think about it again.
     """
 
-    def __init__(self, world, robot, stage, prim_of: dict[str, str]):
+    def __init__(self, world, robot, stage, prim_of: dict[str, str],
+                 home=HOME):
+        self.home = home
         self.world = world
         self.robot = robot
         self.stage = stage
@@ -108,7 +110,18 @@ class SimBackend(ArmBackend):
         self.controller = robot.get_articulation_controller()
         self.held: str | None = None
         self.ticks = 0
-        self.render_every = 4
+        # 0 = never render. Rendering is the entire cost of a batch run: the
+        # first 4-episode blocked batch ran past 600 s with render_every=4 and
+        # had to be cancelled. Eval gates on physics, not on pictures, so the
+        # batch runs blind and only the demo turns rendering on.
+        self.render_every = 0
+        # Big interpolation steps make the batch fast but let the articulation
+        # fall behind its command; the grasp then measures the tool where the
+        # arm IS, not where it was told to be, and misses every time. Modest
+        # step + settle-to-convergence is both fast and correct.
+        self.step_rad = 0.05
+        self.last_cmd: list[float] | None = None
+        self.settle_residual = 0.0
         self.origin_to_centre: dict[str, tuple] = {}
         self.rest_z: dict[str, float] = {}
 
@@ -138,8 +151,9 @@ class SimBackend(ArmBackend):
     def send(self, q):
         from isaacsim.core.utils.types import ArticulationAction
 
+        self.last_cmd = list(q)
         self.controller.apply_action(ArticulationAction(joint_positions=list(q)))
-        self.world.step(render=self.ticks % self.render_every == 0)
+        self.world.step(render=bool(self.render_every) and self.ticks % self.render_every == 0)
         self.ticks += 1
         if self.held:
             # No rigid bodies on these assets, so "held" means "rides the tool
@@ -158,7 +172,9 @@ class SimBackend(ArmBackend):
             # tilt gate cannot fire here. It earns its keep on the real arm.
             "obj_quat": (1.0, 0.0, 0.0, 0.0),
             "obj_speed": 0.0,
-            "zone_rect": ZONE,
+            # Set per goal by run_goal(): where THIS goal was told to put its
+            # object. ZONE is only the fallback and the final delivery test.
+            "zone_rect": getattr(self, "place_zone", None) or ZONE,
             # Not the table surface but this object's RESTING centroid height:
             # the lift gate asks "did it come off the table", and that is the
             # only reference against which the question has an answer.
@@ -167,17 +183,57 @@ class SimBackend(ArmBackend):
         }
 
     def dwell(self, seconds):
-        for _ in range(int(seconds * 40)):
+        """Step until the arm has actually arrived, not for a fixed guess.
+
+        A wall-clock dwell is a bet on servo speed. Waiting for the measured
+        joints to reach the commanded ones is the same check on any arm, and it
+        is what makes the grasp tolerance mean what it says.
+        """
+        budget = max(int(seconds * 40), 1) * 8
+        for _ in range(budget):
             self.world.step(render=False)
             self.ticks += 1
+            if self.held:
+                tip = forward(dict(zip(JOINT_ORDER, self.measured())))
+                self.place_centre(self.held, tip)
+            if self.last_cmd is None:
+                continue
+            self.settle_residual = max(
+                abs(a - b) for a, b in zip(self.measured(), self.last_cmd)
+            )
+            if self.settle_residual < 0.01:
+                return
+
+    GRASP_TOL_M = 0.012
 
     def attach(self, name):
         tip = forward(dict(zip(JOINT_ORDER, self.measured())))
-        if math.dist(tip, _world_xyz(self.stage, self.prim_of[name])) <= 0.012:
+        gap = math.dist(tip, _world_xyz(self.stage, self.prim_of[name]))
+        self.last_grasp_gap = gap
+        if gap <= self.GRASP_TOL_M:
             self.held = name
 
     def detach(self, name=None):
         self.held = None
+
+    def swept_object(self, target: str, pick_xy):
+        """Which object the arm drags through on its way in, if any.
+
+        Parked objects sit a metre off the table, so they never match and need
+        no special case.
+        """
+        for name in self.prim_of:
+            if name == target or name == self.held:
+                continue
+            ox, oy, _oz = self.centre_of(name)
+            if dist_point_segment(ox, oy, self.home[0], self.home[1],
+                                  pick_xy[0], pick_xy[1]) < SWEEP_HALFWIDTH:
+                return name
+        return None
+
+    def knock(self, name):
+        x, y, z = self.centre_of(name)
+        self.place_centre(name, (x + 0.03, y - 0.03, z))
 
 
 def _randomize(rng: random.Random, blocked: bool) -> list[Obj]:
@@ -211,6 +267,7 @@ def kitchen(
     episodes: int = antioch.param(10, ge=1, le=50),
     blocker_rate: float = antioch.param(0.6, ge=0.0, le=1.0),
     bias_mm: float = antioch.param(15.0, ge=0.0, le=40.0, description="Manufactured grasp offset, both arms"),
+    bias_rate: float = antioch.param(0.5, ge=0.0, le=1.0, description="Fraction of first grasps that are offset"),
     seed: int = antioch.param(0),
 ) -> None:
     """Deliver the medicine to the accessibility zone, blocked or not, with and
@@ -263,7 +320,15 @@ def kitchen(
         goals, guard = [], 0
         while (g := plan.next_action()) is not None and guard < 8:
             guard += 1
-            bias = bias_mm / 1000.0 if g.attempts == 0 else 0.0
+            # Keyed on (seed, episode, object, attempt) rather than drawn from
+            # a stream, so supervisor-on and supervisor-off face an identical
+            # sequence of manufactured failures no matter how many goals each
+            # one issues. Applying it to EVERY first grasp instead made the
+            # naive baseline fail by construction — a tautology, not a result.
+            biased = random.Random(
+                f"{seed}|{ep}|{g.obj}|{g.attempts}"
+            ).random() < bias_rate
+            bias = bias_mm / 1000.0 if (g.attempts == 0 and biased) else 0.0
             target = by_name[g.obj]
             grip_z = backend.rest_z[g.obj]
             rep = run_goal(
@@ -271,11 +336,14 @@ def kitchen(
                 bias_m=bias, on_grasp=backend.attach, on_release=backend.detach,
             )
             truth = backend.centre_of(g.obj)
-            by_name[g.obj].x, by_name[g.obj].y = truth[0], truth[1]
+            for other in by_name:
+                ox, oy, _oz = backend.centre_of(other)
+                by_name[other].x, by_name[other].y = ox, oy
             plan.on_result(g, rep.ok, new_pose=(truth[0], truth[1]))
             goals.append({
                 "obj": g.obj, "reason": g.reason, "attempts": g.attempts, "ok": rep.ok,
                 "failed_phase": rep.failed_phase, "unreachable": rep.unreachable,
+                "event": rep.event.kind if rep.event else None, "biased": biased,
             })
 
         mx, my, _mz = backend.centre_of("medicine")
@@ -290,7 +358,12 @@ def kitchen(
                         # evidence, so it travels with the run, not just stdout.
                         "plan_log": list(plan.log)})
         logger.scalar("delivered", 1.0 if delivered else 0.0)
-        logger.info(f"ep {ep}: delivered={delivered} recovered={recovered} goals={len(goals)}")
+        logger.info(
+            f"ep {ep}: delivered={delivered} recovered={recovered} "
+            f"goals={len(goals)} last_grasp_gap="
+            f"{getattr(backend, 'last_grasp_gap', float('nan'))*1000:.1f}mm "
+            f"settle_residual={backend.settle_residual:.4f}rad"
+        )
 
     n = len(results)
     ok = sum(r["delivered"] for r in results)
@@ -310,14 +383,33 @@ def kitchen(
         ),
         "episodes_detail": results,
     })
+    # A check gates the VALIDITY of the experiment, not the desirability of its
+    # outcome. The baseline is supposed to score badly; failing its run for
+    # doing so paints the control condition red in the console and reads as a
+    # broken run rather than a result.
+    fired = sum(1 for r in results for gl in r["goals"] if gl.get("biased"))
     run.check(
         "every episode ran to a decision",
         n == episodes,
         detail=f"{n}/{episodes} episodes completed",
     )
     run.check(
-        "the medicine reached the accessibility zone in a majority of episodes",
-        ok * 2 > n,
-        detail=f"{ok}/{n} delivered ({100.0*ok/max(n,1):.0f}%), "
-               f"blocked scenes {blocked_ok}/{blocked_n}",
+        "the manufactured failure actually fired",
+        fired > 0 or bias_rate == 0.0,
+        detail=f"{fired} biased grasps at rate {bias_rate}",
     )
+    run.check(
+        "blocked scenes were actually staged",
+        blocked_n > 0 or blocker_rate == 0.0,
+        detail=f"{blocked_n}/{n} episodes had a blocker",
+    )
+    if supervisor_on:
+        # The claim itself, asserted only where it is a claim.
+        run.check(
+            "the supervisor delivers the medicine in a majority of episodes",
+            ok * 2 > n,
+            detail=f"{ok}/{n} delivered ({100.0*ok/max(n,1):.0f}%), "
+                   f"blocked scenes {blocked_ok}/{blocked_n}",
+        )
+    else:
+        logger.info(f"[baseline] {ok}/{n} delivered, blocked {blocked_ok}/{blocked_n}")

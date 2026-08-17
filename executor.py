@@ -35,6 +35,7 @@ from arm_ik import (
     to_vector,
 )
 from monitor import Event, monitor
+from planner import dist_point_segment
 
 # --------------------------------------------------------------- constants --
 
@@ -42,6 +43,8 @@ APPROACH_H = 0.070      # m above the object to hover before descending
 LIFT_H = 0.090          # m above the table while carrying
 GRASP_SETTLE_S = 0.35   # let the jaw close and the servos catch up
 STEP_HZ = 40.0          # interpolation rate; servos slam if we jump targets
+PLACE_TOL_M = 0.040     # how close to the commanded spot counts as placed
+SWEEP_HALFWIDTH = 0.055 # how wide a body the arm drags through the approach
 MAX_STEP_RAD = 0.03     # per-tick joint delta, so motion is smooth on hardware
 
 
@@ -82,8 +85,9 @@ class FakeBackend(ArmBackend):
     self-test here always means the logic broke, never the hardware."""
 
     def __init__(self, objects: dict[str, tuple[float, float, float]],
-                 zone_rect=(0.16, 0.26, 0.06, 0.16)):
+                 zone_rect=(0.16, 0.26, 0.06, 0.16), home=(0.075, 0.0)):
         self.objects = dict(objects)
+        self.home = home
         self.zone_rect = zone_rect
         self.q = [0.0] * 6
         self.held: str | None = None
@@ -109,7 +113,7 @@ class FakeBackend(ArmBackend):
             "gripper_xyz": tip,
             "obj_quat": (1.0, 0.0, 0.0, 0.0),
             "obj_speed": 0.0,
-            "zone_rect": self.zone_rect,
+            "zone_rect": getattr(self, "place_zone", None) or self.zone_rect,
             "table_z": 0.0,
             "ticks_in_phase": self.ticks,
         }
@@ -130,6 +134,19 @@ class FakeBackend(ArmBackend):
 
     def detach(self, name=None):
         self.held = None
+
+    def swept_object(self, target: str, pick_xy):
+        for name, (ox, oy, _oz) in self.objects.items():
+            if name == target:
+                continue
+            d = dist_point_segment(ox, oy, self.home[0], self.home[1], *pick_xy)
+            if d < SWEEP_HALFWIDTH:
+                return name
+        return None
+
+    def knock(self, name):
+        x, y, z = self.objects[name]
+        self.objects[name] = (x + 0.03, y - 0.03, z)
 
 
 # ------------------------------------------------------------- the sequence --
@@ -164,15 +181,19 @@ def move_through(backend: ArmBackend, target_q: dict[str, float],
     """Interpolate to a joint target instead of jumping. On hardware a step
     command makes every servo race at full speed to its goal, which is how
     arms knock over the object they were about to pick up."""
+    # Servos need small steps or they slam; a headless sim does not, and at
+    # 1.7 deg a batch spends its whole budget on interpolation ticks. The
+    # backend owns the trade-off.
+    step_rad = getattr(backend, "step_rad", MAX_STEP_RAD)
     goal = to_vector(target_q)
     current = backend.measured()
     while True:
         delta = [g - c for g, c in zip(goal, current)]
         span = max(abs(d) for d in delta)
-        if span <= MAX_STEP_RAD:
+        if span <= step_rad:
             backend.send(goal)
             return
-        scale = MAX_STEP_RAD / span
+        scale = step_rad / span
         current = [c + d * scale for c, d in zip(current, delta)]
         backend.send(current)
         if realtime:
@@ -199,6 +220,33 @@ def run_goal(backend: ArmBackend, obj_name: str, pick_xyz, place_xyz,
         waypoints = plan_waypoints(pick_xyz, place_xyz, bias_m)
     except Unreachable as exc:
         return GoalReport(False, unreachable=str(exc))
+
+    # The place gate asks "did it land where I commanded", not "is it in the
+    # delivery zone". Those coincide only for the user's own goal; a relocated
+    # blocker is parked OUTSIDE the zone by definition, so gating it on the
+    # zone failed every successful relocation and sent the planner into a
+    # retry storm. Measured: cup ended exactly on target and still scored
+    # PLACE_FAIL, three times per episode.
+    gx, gy = place_xyz[0], place_xyz[1]
+    backend.place_zone = (gx - PLACE_TOL_M, gx + PLACE_TOL_M,
+                          gy - PLACE_TOL_M, gy + PLACE_TOL_M)
+
+    # A kinematic executor has no contact, so without this an arm reaching past
+    # an obstacle simply passes through it and the whole premise of the project
+    # goes untested. The consequence is modelled explicitly instead: reaching
+    # for something with an object in the approach corridor knocks that object
+    # and fails the goal. Same geometry the planner uses to PREDICT a blocker,
+    # now used to ENFORCE one — which is what makes the corridor check earn its
+    # keep rather than being a plan-time opinion.
+    sweep = getattr(backend, "swept_object", None)
+    if sweep is not None:
+        hit = sweep(obj_name, (pick_xyz[0], pick_xyz[1]))
+        if hit:
+            backend.knock(hit)
+            return GoalReport(
+                False, failed_phase="approach",
+                event=Event("COLLISION", "approach", f"swept {hit} on the way in"),
+            )
 
     ran = 0
     for wp in waypoints:
@@ -276,5 +324,24 @@ if __name__ == "__main__":
     assert not rep3.ok and rep3.unreachable, "0.48 m must be refused"
     assert be3.sent == [], "nothing may move toward an unreachable target"
     print(f"unreachable: refused before moving — {rep3.unreachable}")
+
+    # 5. Reaching past an obstacle knocks it and fails — the property that makes
+    #    "move the blocker first" worth doing instead of merely tidy.
+    be4 = FakeBackend({"medicine": (0.25, -0.05, 0.02),
+                       "cup": (0.16, -0.03, 0.02)}, zone_rect=ZONE)
+    rep4 = run_goal(be4, "medicine", (0.25, -0.05, 0.02), PLACE,
+                    on_grasp=be4.attach, on_release=be4.detach)
+    assert not rep4.ok and rep4.event and rep4.event.kind == "COLLISION", \
+        f"reaching past the cup must knock it, got {rep4}"
+    assert be4.objects["cup"] != (0.16, -0.03, 0.02), "a knocked cup must move"
+    print(f"obstacle: {rep4.event.detail} -> goal failed at {rep4.failed_phase}")
+
+    # 6. ...and with the cup out of the way, the same reach succeeds.
+    be5 = FakeBackend({"medicine": (0.25, -0.05, 0.02),
+                       "cup": (0.16, 0.14, 0.02)}, zone_rect=ZONE)
+    rep5 = run_goal(be5, "medicine", (0.25, -0.05, 0.02), PLACE,
+                    on_grasp=be5.attach, on_release=be5.detach)
+    assert rep5.ok, f"clear corridor must succeed, got {rep5}"
+    print("obstacle cleared: same reach now succeeds")
 
     print("\nexecutor self-test OK: same sequence will drive Isaac and the SO-101.")
