@@ -55,8 +55,15 @@ PARKED = (0.0, -0.9, 0.0)  # where unused blocks go: out of frame, out of reach
 
 MEDICINE_R, CUP_R, WATER_R = 0.018, 0.030, 0.030
 
-CAM_EYE = (0.75, 0.75, 0.55)
-CAM_TARGET = (0.20, 0.0, 0.05)
+# Measured, not derived. set_camera_view at (0.75, 0.75, 0.55) framed the
+# 0.35 m workspace at roughly 60 px of 1280 — about 9x smaller than the naive
+# geometry predicts — and every frame still passed the exposure gate, so the
+# checks stayed green while the pictures showed nothing worth looking at.
+# Scenario `camera_framing` photographs the same scene at five distances and
+# reports what fraction of the frame the subject occupies: 0.13% at the old
+# placement, 16% here. Re-run it if the layout changes.
+CAM_TARGET = (0.19, 0.0, 0.03)
+CAM_EYE = (0.27, 0.07, 0.08)
 
 
 def _zone_center():
@@ -64,13 +71,34 @@ def _zone_center():
     return ((xmin + xmax) / 2, (ymin + ymax) / 2)
 
 
-def _publish_frame(world, logger, tag: str) -> bool:
+def _publish_frame(world, logger, tag: str, run=None) -> bool:
     """Step once with rendering, capture, and publish if exposure is sane.
     Returns whether a frame was actually published, so callers can keep a
-    running count without duplicating the exposure check."""
-    import numpy as np
+    running count without duplicating the exposure check.
 
-    world.step(render=True)
+    Also written out as a PNG artifact, not only into the recording: the .rrd
+    needs the console to read, while an artifact downloads straight to a
+    laptop. That is what puts these stills on a slide, and what leaves the
+    demo with evidence when the console is not reachable.
+    """
+    import numpy as np
+    from isaacsim.core.utils.viewports import set_camera_view
+
+    # Re-aimed on every capture, not once after reset(). Setting it once looked
+    # correct and produced the same 60-px speck as the default placement: some
+    # part of the step/render loop restores the persp camera, so a framing that
+    # verified fine in isolation silently reverted by the time the scenario
+    # took its first picture.
+    set_camera_view(eye=list(CAM_EYE), target=list(CAM_TARGET),
+                    camera_prim_path="/OmniverseKit_Persp")
+    # Several render steps, not one. capture_viewport() hands back the last
+    # frame the render graph produced, and with render_every=0 that is whatever
+    # was drawn at setup with the default camera — so a single render step
+    # after re-aiming returns the OLD view and the picture silently lags the
+    # camera by one capture. That off-by-one is also why the first framing
+    # sweep looked like it had found a good distance when it had not.
+    for _ in range(4):
+        world.step(render=True)
     frame = antioch.capture_viewport()
     if frame is None:
         return False
@@ -78,6 +106,15 @@ def _publish_frame(world, logger, tag: str) -> bool:
     if not (10.0 <= float(rgb.mean()) <= 220.0):
         return False
     logger.image(f"camera/{tag}", rgb)
+    if run is not None:
+        try:
+            from PIL import Image
+
+            path = f"/tmp/{tag}.png"
+            Image.fromarray(rgb.astype(np.uint8)).save(path)
+            run.add_artifact(path, name=f"{tag}.png")
+        except Exception as exc:
+            logger.warning(f"could not save {tag}.png: {exc}")
     return True
 
 
@@ -392,17 +429,17 @@ def kitchen(
 
             if capture_ep:
                 if not is_medicine and not captured["blocker"]:
-                    captured["blocker"] = _publish_frame(world, logger, "blocker_relocation")
+                    captured["blocker"] = _publish_frame(world, logger, "blocker_relocation", run)
                     published_frames += captured["blocker"]
                 elif is_medicine and not rep.ok and not captured["grasp_fail"]:
-                    captured["grasp_fail"] = _publish_frame(world, logger, "medicine_grasp_biased")
+                    captured["grasp_fail"] = _publish_frame(world, logger, "medicine_grasp_biased", run)
                     published_frames += captured["grasp_fail"]
                 elif is_medicine and rep.ok and not captured["retry"]:
-                    captured["retry"] = _publish_frame(world, logger, "medicine_retry_success")
+                    captured["retry"] = _publish_frame(world, logger, "medicine_retry_success", run)
                     published_frames += captured["retry"]
 
         if capture_ep:
-            published_frames += _publish_frame(world, logger, "final_placement")
+            published_frames += _publish_frame(world, logger, "final_placement", run)
 
         mx, my, _mz = backend.centre_of("medicine")
         delivered = ZONE[0] <= mx <= ZONE[1] and ZONE[2] <= my <= ZONE[3]

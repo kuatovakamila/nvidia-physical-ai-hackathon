@@ -284,3 +284,59 @@ def kitchen_probe(
         published > 0,
         detail=f"{published} frames passed the exposure gate",
     )
+
+
+@antioch.scenario(tags=["probe"], capture=False)
+def camera_framing(run: antioch.ScenarioRun) -> None:
+    """Find a camera placement that actually frames the workspace.
+
+    set_camera_view(eye=(0.75, 0.75, 0.55)) puts the 0.35 m scene at roughly
+    60 px of 1280 — about 9x smaller than the geometry says it should be. The
+    published frames pass every exposure gate and are still useless to look at,
+    which is the worst kind of green. Rather than reason about apertures and
+    stage units, photograph the same scene from a range of distances and read
+    the answer off the pictures.
+    """
+
+    import numpy as np
+    from isaacsim.core.api.robots import Robot
+    from isaacsim.core.utils.prims import create_prim
+    from isaacsim.core.utils.viewports import set_camera_view
+    from PIL import Image
+
+    world = antioch.world()
+    world.scene.add_ground_plane()
+    create_prim("/World/dome_light", "DomeLight", attributes={"inputs:intensity": 300.0})
+    create_prim("/World/key_light", "DistantLight", attributes={"inputs:intensity": 500.0})
+    antioch.load_asset(ARM, prim_path="/World/SO101", version=ARM_VERSION)
+    antioch.load_asset("hackathon/GeometricBlocks 01", prim_path="/World/blocks",
+                       version="1.0.0")
+    world.scene.add(Robot(prim_path="/World/SO101", name="so101"))
+    world.reset()
+    antioch.capture_viewport()
+
+    target = (0.20, 0.0, 0.03)
+    report = {}
+    for scale in (1.0, 0.5, 0.25, 0.12, 0.06):
+        eye = [target[0] + 0.55 * scale, target[1] + 0.55 * scale, target[2] + 0.40 * scale]
+        set_camera_view(eye=eye, target=list(target),
+                        camera_prim_path="/OmniverseKit_Persp")
+        world.step(render=True)
+        frame = antioch.capture_viewport()
+        if frame is None:
+            continue
+        rgb = np.asarray(frame)[:, :, :3]
+        # How much of the frame is not empty backdrop: the ground plane is a
+        # flat grey, so anything with local contrast is subject.
+        col = rgb.std(axis=2)
+        busy = float((col > 6).mean())
+        tag = f"framing_{scale:.2f}"
+        path = f"/tmp/{tag}.png"
+        Image.fromarray(rgb.astype(np.uint8)).save(path)
+        run.add_artifact(path, name=f"{tag}.png")
+        report[tag] = {"eye": [round(v, 3) for v in eye], "subject_fraction": round(busy, 4)}
+        logger.info(f"{tag}: eye={eye} subject_fraction={busy:.4f}")
+
+    run.add_result("framing", report)
+    run.check("at least one placement was photographed", bool(report),
+              detail=f"{len(report)} placements")
