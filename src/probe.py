@@ -463,3 +463,144 @@ def encoder_probe(run: antioch.ScenarioRun) -> None:
     logger.info(f"imageio_ffmpeg exe: {writer}")
     run.add_results({"modules": found, "binaries": binaries, "ffmpeg_exe": str(writer)})
     run.check("some encoder is available", True, detail=str(found))
+
+
+@antioch.scenario(tags=["probe"], capture=False)
+def tool_calibration(run: antioch.ScenarioRun) -> None:
+    """Where is the grasp point really, compared to what forward() claims?
+
+    A carried object is placed at forward(measured_joints). If that point is
+    not between the jaws, the object rides a phantom offset and the video shows
+    blocks moving beside the gripper rather than in it — which is exactly what
+    it showed. L_TOOL was measured to the jaw LINK ORIGIN and flagged in
+    arm_ik.py as needing calibration against a real grasp; this is that
+    calibration, done against the twin instead of by eye.
+    """
+
+    import numpy as np
+    from isaacsim.core.api.robots import Robot
+    from isaacsim.core.utils.types import ArticulationAction
+    from pxr import Usd, UsdGeom
+
+    import sys
+    sys.path.insert(0, "/workspace/project")
+    from arm_ik import JOINT_ORDER, forward
+
+    antioch.load_asset(ARM, prim_path="/World/SO101", version=ARM_VERSION)
+    world = antioch.world()
+    world.scene.add_ground_plane()
+    robot = world.scene.add(Robot(prim_path="/World/SO101", name="so101"))
+    world.reset()
+    controller = robot.get_articulation_controller()
+    stage = antioch.stage()
+
+    def bbox_centre(path):
+        cache = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
+        c = cache.ComputeWorldBound(stage.GetPrimAtPath(path)).ComputeAlignedRange().GetMidpoint()
+        return np.array([float(c[0]), float(c[1]), float(c[2])])
+
+    poses = [
+        [0.0, 0.3, -0.9, -0.6, 0.0, 1.2],
+        [0.4, 0.5, -1.1, -0.5, 0.0, 1.2],
+        [-0.4, 0.2, -0.8, -0.7, 0.0, 1.2],
+        [0.2, 0.8, -1.3, -0.4, 0.0, 1.2],
+        [-0.2, 0.6, -1.0, -0.9, 0.0, 1.2],
+    ]
+    rows = []
+    for q in poses:
+        controller.apply_action(ArticulationAction(joint_positions=q))
+        for _ in range(120):
+            world.step(render=False)
+        measured = [float(v) for v in robot.get_joint_positions()]
+        fk = np.array(forward(dict(zip(JOINT_ORDER, measured))))
+        grip = bbox_centre("/World/SO101/gripper")
+        jaw = bbox_centre("/World/SO101/jaw")
+        mid = (grip + jaw) / 2.0
+        rows.append({
+            "cmd": [round(v, 3) for v in q],
+            "fk": [round(float(v), 4) for v in fk],
+            "gripper": [round(float(v), 4) for v in grip],
+            "jaw": [round(float(v), 4) for v in jaw],
+            "fk_to_gripper_mm": round(float(np.linalg.norm(fk - grip)) * 1000, 1),
+            "fk_to_jawmid_mm": round(float(np.linalg.norm(fk - mid)) * 1000, 1),
+            "delta_to_jawmid_m": [round(float(v), 4) for v in (mid - fk)],
+        })
+        logger.info(f"{rows[-1]}")
+
+    run.add_result("samples", rows)
+    mean_gap = float(np.mean([r["fk_to_jawmid_mm"] for r in rows]))
+    run.add_result("mean_fk_to_jawmid_mm", round(mean_gap, 1))
+    run.check("forward() lands within 10 mm of the jaw midpoint", mean_gap < 10.0,
+              detail=f"mean {mean_gap:.1f} mm across {len(rows)} poses")
+
+
+@antioch.scenario(tags=["probe"], capture=False)
+def zero_pose_frames(run: antioch.ScenarioRun) -> None:
+    """Full zero-pose kinematics: every link's world transform and every
+    joint's world axis.
+
+    arm_ik's planar model assumed the links lie along one axis at q=0. They do
+    not: measured, the upper arm points 77 deg up and the tool carries a ~25 mm
+    lateral offset, so forward() misses the real gripper by ~380 mm. With each
+    link's zero-pose frame and each joint's world axis, forward kinematics can
+    be built exactly (product of exponentials) instead of assumed.
+    """
+
+    from isaacsim.core.api.robots import Robot
+    from pxr import Gf, Usd, UsdGeom, UsdPhysics
+
+    antioch.load_asset(ARM, prim_path="/World/SO101", version=ARM_VERSION)
+    world = antioch.world()
+    world.scene.add(Robot(prim_path="/World/SO101", name="so101"))
+    world.reset()
+    for _ in range(30):
+        world.step(render=False)
+
+    stage = antioch.stage()
+    cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+
+    links = {}
+    for prim in Usd.PrimRange(stage.GetPrimAtPath("/World/SO101")):
+        if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            continue
+        m = cache.GetLocalToWorldTransform(prim)
+        t = m.ExtractTranslation()
+        r = m.ExtractRotationMatrix()
+        links[prim.GetName()] = {
+            "pos": [round(float(v), 6) for v in t],
+            "rot": [[round(float(r[i][j]), 6) for j in range(3)] for i in range(3)],
+        }
+
+    joints = {}
+    for prim in Usd.PrimRange(stage.GetPrimAtPath("/World/SO101")):
+        if not prim.IsA(UsdPhysics.RevoluteJoint):
+            continue
+        j = UsdPhysics.RevoluteJoint(prim)
+        b0 = [t.name for t in j.GetBody0Rel().GetTargets()]
+        b1 = [t.name for t in j.GetBody1Rel().GetTargets()]
+        q0 = j.GetLocalRot0Attr().Get() or Gf.Quatf(1, 0, 0, 0)
+        joints[prim.GetName()] = {
+            "axis": str(j.GetAxisAttr().Get()),
+            "body0": b0[0] if b0 else None,
+            "body1": b1[0] if b1 else None,
+            "local_pos0": [round(float(v), 6) for v in (j.GetLocalPos0Attr().Get() or (0, 0, 0))],
+            "local_rot0": [round(float(q0.GetReal()), 6)] + [round(float(v), 6) for v in q0.GetImaginary()],
+        }
+
+    def bbox_centre(path):
+        c = UsdGeom.BBoxCache(Usd.TimeCode.Default(), [UsdGeom.Tokens.default_])
+        m = c.ComputeWorldBound(stage.GetPrimAtPath(path)).ComputeAlignedRange().GetMidpoint()
+        return [round(float(m[0]), 6), round(float(m[1]), 6), round(float(m[2]), 6)]
+
+    grasp = {
+        "gripper_bbox": bbox_centre("/World/SO101/gripper"),
+        "jaw_bbox": bbox_centre("/World/SO101/jaw"),
+    }
+    grasp["jaw_midpoint"] = [round((a + b) / 2, 6)
+                             for a, b in zip(grasp["gripper_bbox"], grasp["jaw_bbox"])]
+
+    logger.info(f"LINKS {links}")
+    logger.info(f"JOINTS {joints}")
+    logger.info(f"GRASP {grasp}")
+    run.add_results({"links": links, "joints": joints, "grasp": grasp})
+    run.check("all seven links reported", len(links) == 7, detail=f"{len(links)} links")
