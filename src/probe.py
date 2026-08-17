@@ -34,6 +34,66 @@ PROPS = {
 }
 
 
+@antioch.scenario(tags=["probe"], capture=False)
+def arm_kinematics(run: antioch.ScenarioRun) -> None:
+    """
+    Measure the SO-101's link geometry from the calibrated twin.
+
+    Analytic IK needs link lengths. Taking them from a vendor drawing invites
+    a demo where sim and hardware disagree by a centimetre; taking them from
+    the twin that Antioch calibrated means the numbers we solve against are
+    the numbers the simulator actually integrates — and, because the twin is
+    of this exact arm, the numbers the servos will honour too.
+    """
+
+    from pxr import Usd, UsdGeom, UsdPhysics
+
+    antioch.load_asset(ARM, prim_path="/World/SO101", version=ARM_VERSION)
+    world = antioch.world()
+    world.reset()
+
+    stage = antioch.stage()
+    root = stage.GetPrimAtPath("/World/SO101")
+
+    joints = []
+    for prim in Usd.PrimRange(root):
+        if not prim.IsA(UsdPhysics.RevoluteJoint):
+            continue
+        joint = UsdPhysics.RevoluteJoint(prim)
+        body0 = [t.pathString for t in joint.GetBody0Rel().GetTargets()]
+        body1 = [t.pathString for t in joint.GetBody1Rel().GetTargets()]
+        joints.append(
+            {
+                "path": prim.GetPath().pathString,
+                "axis": joint.GetAxisAttr().Get(),
+                "body0": body0[0] if body0 else None,
+                "body1": body1[0] if body1 else None,
+                # Anchor in each body's frame: the offset between consecutive
+                # anchors along the chain IS the link length we need.
+                "local_pos0": [round(float(v), 5) for v in (joint.GetLocalPos0Attr().Get() or (0, 0, 0))],
+                "local_pos1": [round(float(v), 5) for v in (joint.GetLocalPos1Attr().Get() or (0, 0, 0))],
+            }
+        )
+
+    # World positions of every rigid link in the default pose, so the chain can
+    # be reconstructed independently of how the joints declare their anchors.
+    xform_cache = UsdGeom.XformCache(Usd.TimeCode.Default())
+    links = {}
+    for prim in Usd.PrimRange(root):
+        if not prim.HasAPI(UsdPhysics.RigidBodyAPI):
+            continue
+        m = xform_cache.GetLocalToWorldTransform(prim)
+        t = m.ExtractTranslation()
+        links[prim.GetPath().pathString] = [round(float(t[0]), 5), round(float(t[1]), 5), round(float(t[2]), 5)]
+
+    logger.info(f"joints: {joints}")
+    logger.info(f"links: {links}")
+    run.add_result("joints", joints)
+    run.add_result("links", links)
+    run.check("the arm exposes revolute joints", len(joints) >= 5, detail=f"{len(joints)} revolute joints")
+    run.check("the arm exposes rigid links", len(links) >= 5, detail=f"{len(links)} rigid bodies")
+
+
 def _describe_subtree(stage, root_path: str, max_prims: int = 40) -> dict:
     """Prim structure, physics APIs, and world bounds under one asset root."""
     from pxr import Usd, UsdGeom, UsdPhysics
@@ -136,21 +196,20 @@ def kitchen_probe(
     arm = {}
     try:
         dof_names = list(robot.dof_names or [])
-        lower, upper = [], []
-        try:
-            limits = robot.get_articulation_controller().get_joint_limits()
-            lower = [round(float(v), 4) for v in limits[0]]
-            upper = [round(float(v), 4) for v in limits[1]]
-        except Exception:
-            dofp = robot.get_dof_properties()
-            lower = [round(float(v), 4) for v in dofp["lower"]]
-            upper = [round(float(v), 4) for v in dofp["upper"]]
+        # get_joint_limits() is (n_dof, 2) — one [min, max] row per joint, not
+        # a (lower[], upper[]) pair. Indexing it as the latter silently reports
+        # joints 0 and 1 and hides the Jaw, which is the one we actually need.
+        limits = np.asarray(robot.get_articulation_controller().get_joint_limits())
         arm = {
             "dof_count": len(dof_names),
-            "dof_names": dof_names,
-            "lower": lower,
-            "upper": upper,
+            "limits_shape": list(limits.shape),
+            "range_rad": {
+                name: [round(float(limits[i][0]), 4), round(float(limits[i][1]), 4)]
+                for i, name in enumerate(dof_names)
+            },
             "default_pose": [round(float(v), 4) for v in robot.get_joint_positions()],
+            # So the next round-trip never guesses an API name again
+            "api": [n for n in dir(robot) if "dof" in n.lower() or "joint" in n.lower()],
         }
     except Exception as exc:
         arm = {"error": f"{type(exc).__name__}: {exc}"}
@@ -197,6 +256,17 @@ def kitchen_probe(
         if 10.0 <= float(rgb.mean()) <= 220.0:
             logger.image("camera/rgb", rgb)
             published += 1
+            if published == 1:
+                # Also as a downloadable file: the .rrd needs the console, and
+                # a PNG we can open locally settles "do the colours survive the
+                # missing textures" in one look.
+                try:
+                    from PIL import Image
+
+                    Image.fromarray(rgb.astype(np.uint8)).save("/tmp/scene.png")
+                    run.add_artifact("/tmp/scene.png", name="scene.png")
+                except Exception as exc:
+                    logger.warning(f"could not save PNG artifact: {exc}")
     run.add_result("review_frames", published)
 
     run.check(
