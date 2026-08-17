@@ -55,10 +55,42 @@ PARKED = (0.0, -0.9, 0.0)  # where unused blocks go: out of frame, out of reach
 
 MEDICINE_R, CUP_R, WATER_R = 0.018, 0.030, 0.030
 
+# Half-width of the "landed at its assigned spot" rectangle for a relocated
+# blocker. Much tighter than ZONE on purpose: a blocker's destination is a
+# point find_free_spot chose (and deliberately keeps clear of ZONE), not the
+# accessibility zone itself, so it needs its own small rect to be checked
+# against instead of medicine's.
+PLACEMENT_TOL = 0.02
+
+CAM_EYE = (0.75, 0.75, 0.55)
+CAM_TARGET = (0.20, 0.0, 0.05)
+
 
 def _zone_center():
     xmin, xmax, ymin, ymax = ZONE
     return ((xmin + xmax) / 2, (ymin + ymax) / 2)
+
+
+def _dest_rect(xy, tol: float = PLACEMENT_TOL):
+    x, y = xy
+    return (x - tol, x + tol, y - tol, y + tol)
+
+
+def _publish_frame(world, logger, tag: str) -> bool:
+    """Step once with rendering, capture, and publish if exposure is sane.
+    Returns whether a frame was actually published, so callers can keep a
+    running count without duplicating the exposure check."""
+    import numpy as np
+
+    world.step(render=True)
+    frame = antioch.capture_viewport()
+    if frame is None:
+        return False
+    rgb = np.asarray(frame)[:, :, :3]
+    if not (10.0 <= float(rgb.mean()) <= 220.0):
+        return False
+    logger.image(f"camera/{tag}", rgb)
+    return True
 
 
 def _set_translate(stage, prim_path: str, pos) -> None:
@@ -111,6 +143,14 @@ class SimBackend(ArmBackend):
         self.render_every = 4
         self.origin_to_centre: dict[str, tuple] = {}
         self.rest_z: dict[str, float] = {}
+        # Which rectangle state_for()'s place-phase check verifies each
+        # object against — set per goal, since medicine's destination is the
+        # accessibility zone but a relocated blocker's is wherever the
+        # planner sent it.
+        self.zone_of: dict[str, tuple] = {}
+
+    def set_zone(self, name: str, rect: tuple) -> None:
+        self.zone_of[name] = rect
 
     def calibrate(self, name: str) -> None:
         """Measure this prim's origin->centroid offset and its resting height."""
@@ -158,7 +198,7 @@ class SimBackend(ArmBackend):
             # tilt gate cannot fire here. It earns its keep on the real arm.
             "obj_quat": (1.0, 0.0, 0.0, 0.0),
             "obj_speed": 0.0,
-            "zone_rect": ZONE,
+            "zone_rect": self.zone_of.get(name, ZONE),
             # Not the table surface but this object's RESTING centroid height:
             # the lift gate asks "did it come off the table", and that is the
             # only reference against which the question has an answer.
@@ -218,6 +258,7 @@ def kitchen(
 
     from isaacsim.core.api.robots import Robot
     from isaacsim.core.utils.prims import create_prim
+    from isaacsim.core.utils.viewports import set_camera_view
 
     rng = random.Random(seed)
 
@@ -230,7 +271,8 @@ def kitchen(
     antioch.load_asset(BLOCKS, prim_path="/World/blocks", version="1.0.0")
     robot = world.scene.add(Robot(prim_path="/World/SO101", name="so101"))
     world.reset()
-    antioch.capture_viewport()  # spend the pre-scene frame
+    antioch.capture_viewport()  # spend the pre-scene (black) frame
+    set_camera_view(eye=list(CAM_EYE), target=list(CAM_TARGET), camera_prim_path="/OmniverseKit_Persp")
 
     stage = antioch.stage()
     prim_of = {role: f"/World/blocks/{mesh}/{mesh}" for role, mesh in ROLES.items()}
@@ -245,7 +287,12 @@ def kitchen(
     logger.info(f"resting centroid heights: {backend.rest_z}")
 
     results = []
+    published_frames = 0
     for ep in range(episodes):
+        # Publishing costs a render + a viewport read; keep the scenario fast
+        # by only capturing the one episode that best demonstrates the loop.
+        capture_ep = ep == 0
+        captured = {"blocker": False, "grasp_fail": False, "retry": False}
         scene = _randomize(rng, blocked=rng.random() < blocker_rate)
         by_name = {o.name: o for o in scene}
         for role in prim_of:
@@ -263,9 +310,18 @@ def kitchen(
         goals, guard = [], 0
         while (g := plan.next_action()) is not None and guard < 8:
             guard += 1
-            bias = bias_mm / 1000.0 if g.attempts == 0 else 0.0
+            is_medicine = g.obj == "medicine"
+            # The manufactured grasp failure studies medicine's recovery
+            # path specifically — it must not also sabotage blocker
+            # relocation, which has nothing to do with the bias study.
+            bias = bias_mm / 1000.0 if (is_medicine and g.attempts == 0) else 0.0
             target = by_name[g.obj]
             grip_z = backend.rest_z[g.obj]
+            # Medicine's destination is the accessibility zone; a relocated
+            # blocker's is the specific spot the planner picked for it — the
+            # place-phase gate has to check each object against the rect
+            # that actually describes success for it.
+            backend.set_zone(g.obj, ZONE if is_medicine else _dest_rect(g.to_xy))
             rep = run_goal(
                 backend, g.obj, (target.x, target.y, grip_z), (g.to_xy[0], g.to_xy[1], grip_z),
                 bias_m=bias, on_grasp=backend.attach, on_release=backend.detach,
@@ -277,6 +333,20 @@ def kitchen(
                 "obj": g.obj, "reason": g.reason, "attempts": g.attempts, "ok": rep.ok,
                 "failed_phase": rep.failed_phase, "unreachable": rep.unreachable,
             })
+
+            if capture_ep:
+                if not is_medicine and not captured["blocker"]:
+                    captured["blocker"] = _publish_frame(world, logger, "blocker_relocation")
+                    published_frames += captured["blocker"]
+                elif is_medicine and not rep.ok and not captured["grasp_fail"]:
+                    captured["grasp_fail"] = _publish_frame(world, logger, "medicine_grasp_biased")
+                    published_frames += captured["grasp_fail"]
+                elif is_medicine and rep.ok and not captured["retry"]:
+                    captured["retry"] = _publish_frame(world, logger, "medicine_retry_success")
+                    published_frames += captured["retry"]
+
+        if capture_ep:
+            published_frames += _publish_frame(world, logger, "final_placement")
 
         mx, my, _mz = backend.centre_of("medicine")
         delivered = ZONE[0] <= mx <= ZONE[1] and ZONE[2] <= my <= ZONE[3]
@@ -308,6 +378,7 @@ def kitchen(
         "relocations": sum(
             1 for r in results for gl in r["goals"] if gl["reason"] != "user"
         ),
+        "review_frames": published_frames,
         "episodes_detail": results,
     })
     run.check(
@@ -320,4 +391,9 @@ def kitchen(
         ok * 2 > n,
         detail=f"{ok}/{n} delivered ({100.0*ok/max(n,1):.0f}%), "
                f"blocked scenes {blocked_ok}/{blocked_n}",
+    )
+    run.check(
+        "the scene published a usable review frame",
+        published_frames > 0,
+        detail=f"{published_frames} frames passed the exposure gate",
     )
