@@ -287,22 +287,29 @@ def kitchen_probe(
 
 
 @antioch.scenario(tags=["probe"], capture=False)
-def camera_framing(run: antioch.ScenarioRun) -> None:
-    """Find a camera placement that actually frames the workspace.
+def camera_framing(
+    run: antioch.ScenarioRun,
+    elevation_deg: float = antioch.param(50.0, ge=5.0, le=89.0),
+) -> None:
+    """Find a camera placement that frames the STAGED workspace.
 
-    set_camera_view(eye=(0.75, 0.75, 0.55)) puts the 0.35 m scene at roughly
-    60 px of 1280 — about 9x smaller than the geometry says it should be. The
-    published frames pass every exposure gate and are still useless to look at,
-    which is the worst kind of green. Rather than reason about apertures and
-    stage units, photograph the same scene from a range of distances and read
-    the answer off the pictures.
+    Two lessons are baked in. capture_viewport() returns the last frame the
+    render graph produced, so a single render step after moving the camera
+    hands back the previous view — the first version of this sweep was
+    off by one and "found" a distance that was really its neighbour's.
+    And the scene has to be staged the way the eval stages it: sweeping
+    against all 18 blocks clustered at the origin optimises for a picture
+    the real scenario never takes.
     """
+
+    import math
 
     import numpy as np
     from isaacsim.core.api.robots import Robot
     from isaacsim.core.utils.prims import create_prim
     from isaacsim.core.utils.viewports import set_camera_view
     from PIL import Image
+    from pxr import Gf, Usd, UsdGeom
 
     world = antioch.world()
     world.scene.add_ground_plane()
@@ -315,28 +322,144 @@ def camera_framing(run: antioch.ScenarioRun) -> None:
     world.reset()
     antioch.capture_viewport()
 
-    target = (0.20, 0.0, 0.03)
+    stage = antioch.stage()
+
+    def put(prim_path, pos):
+        prim = stage.GetPrimAtPath(prim_path)
+        xf = UsdGeom.Xformable(prim)
+        for op in xf.GetOrderedXformOps():
+            if op.GetOpType() == UsdGeom.XformOp.TypeTranslate:
+                op.Set(Gf.Vec3d(*pos))
+                return
+        xf.AddTranslateOp().Set(Gf.Vec3d(*pos))
+
+    # Same staging as the eval: three blocks at the extremes of the workspace,
+    # everything else off the table. Framing that fits these fits any episode.
+    staged = {
+        "SM_CylinderRed_01": (0.26, -0.13, 0.0),   # medicine, far corner
+        "SM_BlockGreen_01": (0.165, 0.125, 0.0),   # water, near the zone
+        "SM_BlockBlue_01": (0.17, -0.05, 0.0),     # cup, mid corridor
+    }
+    for prim in Usd.PrimRange(stage.GetPrimAtPath("/World/blocks")):
+        name = prim.GetName()
+        if not name.startswith("SM_") or not prim.IsA(UsdGeom.Xform):
+            continue
+        put(prim.GetPath().pathString, staged.get(name, (0.0, -0.9, 0.0)))
+
+    target = (0.16, 0.0, 0.02)
+    el = math.radians(elevation_deg)
     report = {}
-    for scale in (1.0, 0.5, 0.25, 0.12, 0.06):
-        eye = [target[0] + 0.55 * scale, target[1] + 0.55 * scale, target[2] + 0.40 * scale]
+    for dist in (0.20, 0.30, 0.45, 0.65, 0.90):
+        eye = [
+            target[0] + dist * math.cos(el) * 0.75,
+            target[1] + dist * math.cos(el) * 0.66,
+            target[2] + dist * math.sin(el),
+        ]
         set_camera_view(eye=eye, target=list(target),
                         camera_prim_path="/OmniverseKit_Persp")
-        world.step(render=True)
+        for _ in range(4):          # flush the render graph, see docstring
+            world.step(render=True)
         frame = antioch.capture_viewport()
         if frame is None:
             continue
         rgb = np.asarray(frame)[:, :, :3]
-        # How much of the frame is not empty backdrop: the ground plane is a
-        # flat grey, so anything with local contrast is subject.
-        col = rgb.std(axis=2)
-        busy = float((col > 6).mean())
-        tag = f"framing_{scale:.2f}"
+        busy = float((rgb.std(axis=2) > 6).mean())
+        tag = f"d{dist:.2f}"
         path = f"/tmp/{tag}.png"
         Image.fromarray(rgb.astype(np.uint8)).save(path)
         run.add_artifact(path, name=f"{tag}.png")
         report[tag] = {"eye": [round(v, 3) for v in eye], "subject_fraction": round(busy, 4)}
-        logger.info(f"{tag}: eye={eye} subject_fraction={busy:.4f}")
+        logger.info(f"{tag}: eye={[round(v,3) for v in eye]} subject={busy:.4f}")
 
     run.add_result("framing", report)
-    run.check("at least one placement was photographed", bool(report),
-              detail=f"{len(report)} placements")
+    run.check("every placement was photographed", len(report) == 5,
+              detail=f"{len(report)}/5 placements")
+
+
+@antioch.scenario(tags=["probe"])
+def video_probe(run: antioch.ScenarioRun) -> None:
+    """Does the platform's automatic capture produce a video artifact?
+
+    Every scenario so far ran with capture=False, which the init scaffold
+    recommends because the automatic viewport points wherever Kit last left it.
+    But it is the only mechanism that might yield a moving picture rather than
+    stills, and a demo wants motion. This asks the cheap version of the
+    question before anything is rewired: sweep the arm, render every step, and
+    see what lands in the artifact list.
+    """
+
+    import math
+
+    from isaacsim.core.api.robots import Robot
+    from isaacsim.core.utils.prims import create_prim
+    from isaacsim.core.utils.types import ArticulationAction
+    from isaacsim.core.utils.viewports import set_camera_view
+
+    world = antioch.world()
+    world.scene.add_ground_plane()
+    create_prim("/World/dome_light", "DomeLight", attributes={"inputs:intensity": 300.0})
+    create_prim("/World/key_light", "DistantLight", attributes={"inputs:intensity": 500.0})
+    antioch.load_asset(ARM, prim_path="/World/SO101", version=ARM_VERSION)
+    robot = world.scene.add(Robot(prim_path="/World/SO101", name="so101"))
+    world.reset()
+    antioch.capture_viewport()
+    set_camera_view(eye=[0.377, 0.191, 0.365], target=[0.16, 0.0, 0.02],
+                    camera_prim_path="/OmniverseKit_Persp")
+
+    controller = robot.get_articulation_controller()
+    for i in range(240):
+        t = i / 240.0
+        q = [0.9 * math.sin(2 * math.pi * t), 0.5 * math.sin(4 * math.pi * t),
+             -0.8, -0.5, 0.0, 0.6 + 0.6 * math.sin(6 * math.pi * t)]
+        controller.apply_action(ArticulationAction(joint_positions=q))
+        world.step(render=True)
+
+    run.add_result("rendered_steps", 240)
+    run.check("the sweep completed", True, detail="240 rendered steps")
+
+
+@antioch.scenario(tags=["probe"], capture=False)
+def encoder_probe(run: antioch.ScenarioRun) -> None:
+    """What can this image encode a video with?
+
+    capture=True produced no video artifact, so the frames have to be encoded
+    in-scenario. Rather than guess at imageio vs cv2 vs a bare ffmpeg binary
+    and burn a cloud round-trip per guess, ask once.
+    """
+
+    import importlib
+    import shutil
+    import subprocess
+
+    found = {}
+    for mod in ("imageio", "imageio_ffmpeg", "cv2", "av", "PIL"):
+        try:
+            m = importlib.import_module(mod)
+            found[mod] = getattr(m, "__version__", "present")
+        except Exception as exc:
+            found[mod] = f"MISSING ({type(exc).__name__})"
+
+    binaries = {}
+    for exe in ("ffmpeg", "ffprobe"):
+        path = shutil.which(exe)
+        binaries[exe] = path or "MISSING"
+        if path:
+            try:
+                out = subprocess.run([path, "-version"], capture_output=True,
+                                     text=True, timeout=20)
+                binaries[exe] = out.stdout.splitlines()[0][:90]
+            except Exception as exc:
+                binaries[exe] = f"{path} (version check failed: {exc})"
+
+    writer = None
+    try:
+        import imageio_ffmpeg
+        writer = imageio_ffmpeg.get_ffmpeg_exe()
+    except Exception as exc:
+        writer = f"imageio_ffmpeg.get_ffmpeg_exe failed: {exc}"
+
+    logger.info(f"modules: {found}")
+    logger.info(f"binaries: {binaries}")
+    logger.info(f"imageio_ffmpeg exe: {writer}")
+    run.add_results({"modules": found, "binaries": binaries, "ffmpeg_exe": str(writer)})
+    run.check("some encoder is available", True, detail=str(found))

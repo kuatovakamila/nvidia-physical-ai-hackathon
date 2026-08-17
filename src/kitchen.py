@@ -62,8 +62,8 @@ MEDICINE_R, CUP_R, WATER_R = 0.018, 0.030, 0.030
 # Scenario `camera_framing` photographs the same scene at five distances and
 # reports what fraction of the frame the subject occupies: 0.13% at the old
 # placement, 16% here. Re-run it if the layout changes.
-CAM_TARGET = (0.19, 0.0, 0.03)
-CAM_EYE = (0.27, 0.07, 0.08)
+CAM_TARGET = (0.16, 0.0, 0.02)
+CAM_EYE = (0.377, 0.191, 0.365)
 
 
 def _zone_center():
@@ -181,6 +181,57 @@ class SimBackend(ArmBackend):
         self.settle_residual = 0.0
         self.origin_to_centre: dict[str, tuple] = {}
         self.rest_z: dict[str, float] = {}
+        self._writer = None
+        self.record_every = 3
+        self.record_size = (960, 540)
+        self.recorded_frames = 0
+
+    def start_recording(self, path: str, fps: int = 20) -> bool:
+        """Open a video file and render into it from here on.
+
+        Frames stream straight to the encoder instead of accumulating in a
+        list: at 1280x720 a single episode is a couple of thousand ticks, and
+        buffering those is gigabytes for a clip nobody needs in memory.
+        There is no ffmpeg binary in this image — measured by `encoder_probe`
+        — but the opencv wheel carries its own mp4v encoder.
+        """
+        import cv2
+        from isaacsim.core.utils.viewports import set_camera_view
+
+        try:
+            self._writer = cv2.VideoWriter(
+                path, cv2.VideoWriter_fourcc(*"mp4v"), fps, self.record_size
+            )
+            if not self._writer.isOpened():
+                self._writer = None
+                return False
+        except Exception:
+            self._writer = None
+            return False
+        set_camera_view(eye=list(CAM_EYE), target=list(CAM_TARGET),
+                        camera_prim_path="/OmniverseKit_Persp")
+        self.render_every = self.record_every
+        self.recorded_frames = 0
+        return True
+
+    def _grab(self) -> None:
+        import cv2
+        import numpy as np
+
+        frame = antioch.capture_viewport()
+        if frame is None:
+            return
+        rgb = np.asarray(frame)[:, :, :3].astype(np.uint8)
+        small = cv2.resize(rgb, self.record_size, interpolation=cv2.INTER_AREA)
+        self._writer.write(cv2.cvtColor(small, cv2.COLOR_RGB2BGR))
+        self.recorded_frames += 1
+
+    def stop_recording(self) -> int:
+        if self._writer is not None:
+            self._writer.release()
+            self._writer = None
+        self.render_every = 0
+        return self.recorded_frames
 
     def calibrate(self, name: str) -> None:
         """Measure this prim's origin->centroid offset and its resting height."""
@@ -210,8 +261,11 @@ class SimBackend(ArmBackend):
 
         self.last_cmd = list(q)
         self.controller.apply_action(ArticulationAction(joint_positions=list(q)))
-        self.world.step(render=bool(self.render_every) and self.ticks % self.render_every == 0)
+        rendering = bool(self.render_every) and self.ticks % self.render_every == 0
+        self.world.step(render=rendering)
         self.ticks += 1
+        if rendering and self._writer is not None:
+            self._grab()
         if self.held:
             # No rigid bodies on these assets, so "held" means "rides the tool
             # tip". Honest about what it is; identical from the planner's side.
@@ -328,6 +382,7 @@ def kitchen(
     bias_mm: float = antioch.param(15.0, ge=0.0, le=40.0, description="Manufactured grasp offset, both arms"),
     bias_rate: float = antioch.param(0.5, ge=0.0, le=1.0, description="Fraction of first grasps that are offset"),
     seed: int = antioch.param(0),
+    record: bool = antioch.param(False, description="Record the captured episode to episode.mp4"),
 ) -> None:
     """Deliver the medicine to the accessibility zone, blocked or not, with and
     without the supervisor."""
@@ -352,6 +407,27 @@ def kitchen(
 
     stage = antioch.stage()
     prim_of = {role: f"/World/blocks/{mesh}/{mesh}" for role, mesh in ROLES.items()}
+
+    # The asset is a SET of 18 blocks. Only three play a part; the other
+    # fifteen stay exactly where the asset dropped them unless told otherwise,
+    # which left them strewn across the workspace — cluttering every review
+    # frame and sitting inside the reach envelope the planner samples for free
+    # spots. Enumerated from the stage rather than hard-coded so a new asset
+    # version cannot silently leave strays behind.
+    from pxr import Usd, UsdGeom
+
+    in_play = set(ROLES.values())
+    strays = 0
+    for prim in Usd.PrimRange(stage.GetPrimAtPath("/World/blocks")):
+        name = prim.GetName()
+        if not name.startswith("SM_") or name in in_play:
+            continue
+        if not prim.IsA(UsdGeom.Xform):
+            continue
+        _set_translate(stage, prim.GetPath().pathString, PARKED)
+        strays += 1
+    logger.info(f"parked {strays} unused blocks off-table")
+    run.add_result("parked_blocks", strays)
     for role, path in prim_of.items():
         if not stage.GetPrimAtPath(path).IsValid():
             run.fail(f"expected block prim missing: {path}")
@@ -381,6 +457,11 @@ def kitchen(
             "cup" in by_name or ep == episodes - 1
         )
         capture_done = capture_done or capture_ep
+        recording = False
+        if capture_ep and record:
+            recording = backend.start_recording("/tmp/episode.mp4")
+            if not recording:
+                logger.warning("cv2.VideoWriter would not open; stills only")
         for role in prim_of:
             o = by_name.get(role)
             if o:
@@ -440,6 +521,12 @@ def kitchen(
 
         if capture_ep:
             published_frames += _publish_frame(world, logger, "final_placement", run)
+        if recording:
+            frames = backend.stop_recording()
+            logger.info(f"recorded {frames} frames to episode.mp4")
+            run.add_result("video_frames", frames)
+            if frames > 0:
+                run.add_artifact("/tmp/episode.mp4", name="episode.mp4")
 
         mx, my, _mz = backend.centre_of("medicine")
         delivered = ZONE[0] <= mx <= ZONE[1] and ZONE[2] <= my <= ZONE[3]
