@@ -48,6 +48,24 @@ TOOL0 = (0.336584, 0.032893, 0.234457)
 # without hard-coding which way "down the gripper" points.
 WRIST0 = (0.219649, 0.001976, 0.230940)
 
+# Where the base link sat when all of the above was measured. Everything here
+# is world-frame, which is only meaningful relative to a known base: the same
+# arm loaded into a scene that already has a ground plane settles at a
+# different height, and then every FK result is off by that constant — which
+# looks exactly like a gripper that stops 36 mm above every block it reaches
+# for. Callers announce the real base with set_base_offset().
+BASE0 = (-0.000419, -0.000008, -0.030009)
+_OFFSET = [0.0, 0.0, 0.0]
+
+
+def set_base_offset(base_pos):
+    """Tell the kinematics where this scene's base link actually is."""
+    _OFFSET[:] = [base_pos[i] - BASE0[i] for i in range(3)]
+
+
+def base_offset():
+    return tuple(_OFFSET)
+
 LIMITS = {
     "Rotation": (-1.9199, 1.9199),
     "Pitch": (-1.7453, 1.7453),
@@ -132,9 +150,14 @@ def _fk_point(p0, q):
     return p
 
 
+def _forward_raw(q):
+    return _fk_point(TOOL0, q)
+
+
 def forward(q):
     """World position of the grasp point for a joint dict."""
-    return _fk_point(TOOL0, q)
+    p = _fk_point(TOOL0, q)
+    return (p[0] + _OFFSET[0], p[1] + _OFFSET[1], p[2] + _OFFSET[2])
 
 
 def tool_axis(q):
@@ -179,7 +202,7 @@ def _lin_solve(a, b):
     return [m[i][n] / m[i][i] for i in range(n)]
 
 
-def _residual(q, target, want_tilt):
+def _residual(q, target, want_tilt, tilt_weight=None):
     """Position error in metres, plus tilt error scaled into metres.
 
     Tilt is a real constraint, not a preference. Solving position alone leaves
@@ -189,32 +212,41 @@ def _residual(q, target, want_tilt):
     TILT_WEIGHT converts radians into comparable metres so neither term
     swamps the other.
     """
-    p = forward(q)
+    p = _forward_raw(q)
     got = math.asin(max(-1.0, min(1.0, tool_axis(q)[2])))
+    w = TILT_WEIGHT if tilt_weight is None else tilt_weight
     return [target[0] - p[0], target[1] - p[1], target[2] - p[2],
-            TILT_WEIGHT * (want_tilt - got)]
+            w * (want_tilt - got)]
 
 
 def inverse(pose, seed=None, iters=120, tol=5e-4):
     """Try each seed in turn and return the first solution that lands."""
     starts = [seed] if seed is not None else list(SEEDS)
     last = None
-    for start in starts:
-        try:
-            return _inverse_from(pose, start, iters, tol)
-        except Unreachable as exc:
-            last = exc
+    # Tilt first, position-only second. Insisting on a top-down approach makes
+    # points near the edge of the envelope unreachable that the arm can plainly
+    # touch — measured on the lift waypoint, which sits 90 mm above a grasp the
+    # solver had just made. Reaching the object matters more than the angle it
+    # is reached at, so the angle is what gives way.
+    for weight in (TILT_WEIGHT, 0.0):
+        for start in starts:
+            try:
+                return _inverse_from(pose, start, iters, tol, weight)
+            except Unreachable as exc:
+                last = exc
     raise last if last else Unreachable("no seed attempted")
 
 
-def _inverse_from(pose, seed, iters, tol):
+def _inverse_from(pose, seed, iters, tol, tilt_weight=None):
+    """Solves in the calibrated frame; the caller's target is shifted into it
+    once here rather than at every residual evaluation."""
     """Damped least squares IK on position, biased toward the requested tilt.
 
     Returns a full joint dict. Raises Unreachable rather than returning a pose
     that silently misses — a planner that thinks it commanded a grasp and did
     not is the worst failure mode we can build.
     """
-    target = (pose.x, pose.y, pose.z)
+    target = (pose.x - _OFFSET[0], pose.y - _OFFSET[1], pose.z - _OFFSET[2])
     q = dict(REST if seed is None else seed)
     for name in JOINT_ORDER:
         q.setdefault(name, REST[name])
@@ -222,7 +254,7 @@ def _inverse_from(pose, seed, iters, tol):
     lam = 0.03
     h = 1e-6
     for _ in range(iters):
-        err = _residual(q, target, pose.pitch)
+        err = _residual(q, target, pose.pitch, tilt_weight)
         if math.sqrt(sum(e * e for e in err[:3])) < tol and abs(err[3]) < 0.02:
             break
         # 4x4 Jacobian of [position, weighted tilt] against the four joints.
@@ -230,7 +262,7 @@ def _inverse_from(pose, seed, iters, tol):
         for name in IK_JOINTS:
             qh = dict(q)
             qh[name] = q[name] + h
-            eh = _residual(qh, target, pose.pitch)
+            eh = _residual(qh, target, pose.pitch, tilt_weight)
             cols.append([(err[i] - eh[i]) / h for i in range(4)])
         jjt = [[sum(cols[k][i] * cols[k][j] for k in range(4))
                 + (lam * lam if i == j else 0.0) for j in range(4)] for i in range(4)]
@@ -241,7 +273,7 @@ def _inverse_from(pose, seed, iters, tol):
             step = sum(cols[k][i] * w[i] for i in range(4))
             q[name] = _clamp(name, q[name] + max(-0.3, min(0.3, step)))
 
-    gap = math.dist(forward(q), target)
+    gap = math.dist(_forward_raw(q), target)
     if gap > 0.005:
         raise Unreachable(f"closest approach {gap*1000:.0f} mm at "
                           f"({target[0]:.3f}, {target[1]:.3f}, {target[2]:.3f})")

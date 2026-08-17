@@ -25,6 +25,7 @@ import random
 
 import antioch
 
+import arm_ik
 from arm_ik import JOINT_ORDER, forward, reachable
 from executor import SWEEP_HALFWIDTH, ArmBackend, run_goal
 from planner import Obj, Planner, dist_point_segment
@@ -257,12 +258,25 @@ class SimBackend(ArmBackend):
         return _world_xyz(self.stage, self.prim_of[name])
 
     def send(self, q):
-        from isaacsim.core.utils.types import ArticulationAction
+        """Set the pose directly rather than asking the drives for it.
 
+        apply_action() goes through the articulation's position drives, and
+        measured against the twin they do not deliver: at a low reach the wrist
+        sat 0.38 rad from its command and the gripper ended 36 mm from the
+        block it was supposed to be holding, so every grasp missed. Nothing
+        else in this backend is dynamic either — the props carry no rigid
+        bodies and contact is modelled, not simulated — so driving the arm
+        kinematically is the consistent choice, not a shortcut. RealBackend is
+        where drive dynamics are real, and there they are the servos' problem.
+        """
         self.last_cmd = list(q)
-        self.controller.apply_action(ArticulationAction(joint_positions=list(q)))
+        self._hold()
         rendering = bool(self.render_every) and self.ticks % self.render_every == 0
         self.world.step(render=rendering)
+        # Again after the step: one integration of gravity still lands between
+        # the pin and the measurement, and that single step was worth 15 mm at
+        # the gripper.
+        self._hold()
         self.ticks += 1
         if rendering and self._writer is not None:
             self._grab()
@@ -271,6 +285,20 @@ class SimBackend(ArmBackend):
             # tip". Honest about what it is; identical from the planner's side.
             tip = forward(dict(zip(JOINT_ORDER, self.measured())))
             self.place_centre(self.held, tip)
+
+    def _hold(self) -> None:
+        """Pin the arm to its commanded pose.
+
+        set_joint_positions() sets state, and then world.step() integrates
+        dynamics on top of it: with no drive holding the pose, gravity pulled
+        the shoulder 0.107 rad and the wrist 0.088 rad off command between the
+        set and the measurement, putting the gripper 27 mm above every block.
+        Zeroing velocity too, or the sag arrives as momentum on the next step.
+        """
+        if self.last_cmd is None:
+            return
+        self.robot.set_joint_positions(list(self.last_cmd))
+        self.robot.set_joint_velocities([0.0] * len(self.last_cmd))
 
     def measured(self):
         return [float(v) for v in self.robot.get_joint_positions()]
@@ -304,7 +332,9 @@ class SimBackend(ArmBackend):
         """
         budget = max(int(seconds * 40), 1) * 8
         for _ in range(budget):
+            self._hold()
             self.world.step(render=False)
+            self._hold()
             self.ticks += 1
             if self.held:
                 tip = forward(dict(zip(JOINT_ORDER, self.measured())))
@@ -321,8 +351,23 @@ class SimBackend(ArmBackend):
 
     def attach(self, name):
         tip = forward(dict(zip(JOINT_ORDER, self.measured())))
-        gap = math.dist(tip, _world_xyz(self.stage, self.prim_of[name]))
+        obj = _world_xyz(self.stage, self.prim_of[name])
+        gap = math.dist(tip, obj)
         self.last_grasp_gap = gap
+        # Which leg is lying: the commanded pose, the arm that tracked it, or
+        # the object's assumed position. A single scalar gap cannot say.
+        self.last_grasp_detail = {
+            "commanded": [round(v, 4) for v in (self.last_cmd or [])],
+            "measured": [round(v, 4) for v in self.measured()],
+            "fk_tip": [round(v, 4) for v in tip],
+            "object": [round(v, 4) for v in obj],
+            "gap_mm": round(gap * 1000, 1),
+        }
+        logger.info(
+            f"ATTACH {name} gap={gap*1000:.1f}mm "
+            f"cmd={[round(v,4) for v in (self.last_cmd or [])]} "
+            f"meas={[round(v,4) for v in self.measured()]} "
+            f"dofs={list(self.robot.dof_names)}")
         if gap <= self.GRASP_TOL_M:
             self.held = name
 
@@ -435,6 +480,17 @@ def kitchen(
     backend = SimBackend(world, robot, stage, prim_of)
     for role in prim_of:
         backend.calibrate(role)
+    # The kinematics constants were measured in a scene with no ground plane.
+    # If the base sits at a different height here, every FK result is off by
+    # that constant — which would look exactly like a gripper that stops 36 mm
+    # above every block it reaches for.
+    from pxr import Usd, UsdGeom as _UG
+
+    _t = _UG.XformCache(Usd.TimeCode.Default()).GetLocalToWorldTransform(
+        stage.GetPrimAtPath("/World/SO101/base")).ExtractTranslation()
+    arm_ik.set_base_offset((float(_t[0]), float(_t[1]), float(_t[2])))
+    logger.info(f"BASE at {[round(float(v),5) for v in _t]}, "
+                f"kinematics offset {[round(v,5) for v in arm_ik.base_offset()]}")
     logger.info(f"origin->centre offsets: {backend.origin_to_centre}")
     logger.info(f"resting centroid heights: {backend.rest_z}")
 
@@ -546,6 +602,8 @@ def kitchen(
             f"{getattr(backend, 'last_grasp_gap', float('nan'))*1000:.1f}mm "
             f"settle_residual={backend.settle_residual:.4f}rad"
         )
+        if ep == 0:
+            logger.info(f"GRASPDETAIL {getattr(backend, 'last_grasp_detail', None)}")
 
     n = len(results)
     ok = sum(r["delivered"] for r in results)
