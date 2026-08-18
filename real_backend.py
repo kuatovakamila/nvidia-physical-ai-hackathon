@@ -117,7 +117,12 @@ class RealBackend(ArmBackend):
     # -- lifecycle -----------------------------------------------------------
     def connect(self):
         self.robot.connect(calibrate=False)
-        if not self.robot.is_calibrated:
+        # A calibration FILE is not a calibrated ARM: lerobot compares the file
+        # against registers inside each servo, and without pushing it there the
+        # arm reports uncalibrated and reads in whatever frame it booted with.
+        # calibrate=True would do this too, but only after an interactive
+        # prompt, which is no use inside a run.
+        if not _push_calibration(self.robot):
             raise RuntimeError(
                 "arm is not calibrated. Run:  lerobot-calibrate "
                 "--robot.type=so101_follower --robot.port=<port> --robot.id=<id>"
@@ -182,6 +187,19 @@ class RealBackend(ArmBackend):
 # ------------------------------------------------------------------ tooling --
 
 
+def _push_calibration(robot) -> bool:
+    """A calibration FILE is not a calibrated ARM.
+
+    lerobot compares the file against registers inside each servo; without
+    pushing it there the arm reports uncalibrated and reads in whatever frame
+    it booted with. connect(calibrate=True) also does this, but only behind an
+    interactive prompt, which is no use inside a script.
+    """
+    if robot.calibration and not robot.is_calibrated:
+        robot.bus.write_calibration(robot.calibration)
+    return robot.is_calibrated
+
+
 def cmd_probe(port):
     """Read the arm. Commands nothing."""
     from lerobot.robots.so_follower import SO101Follower, SO101FollowerConfig
@@ -189,7 +207,7 @@ def cmd_probe(port):
     robot = SO101Follower(SO101FollowerConfig(
         id="interx_follower", port=port, use_degrees=True))
     robot.connect(calibrate=False)
-    print(f"connected: {robot.is_connected}   calibrated: {robot.is_calibrated}")
+    print(f"connected: {robot.is_connected}   calibrated: {_push_calibration(robot)}")
     try:
         for i in range(10):
             obs = robot.get_observation()
@@ -211,8 +229,8 @@ def cmd_map(port, live):
         id="interx_follower", port=port, use_degrees=True,
         max_relative_target=SAFE_STEP_DEG))
     robot.connect(calibrate=False)
-    if not robot.is_calibrated:
-        print("arm is not calibrated — run lerobot-calibrate first")
+    if not _push_calibration(robot):
+        print("arm is not calibrated — run calibrate_sweep.py --write first")
         robot.disconnect()
         return
     print("Each joint gets a +3 deg nudge; the encoder says which way that is.")

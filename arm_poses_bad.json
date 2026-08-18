@@ -1,0 +1,68 @@
+{
+  "home": {
+    "joints": {
+      "shoulder_pan": 71.64835164835165,
+      "shoulder_lift": -88.43956043956044,
+      "elbow_flex": -25.142857142857142,
+      "wrist_flex": -172.04395604395606,
+      "wrist_roll": 80.13186813186813,
+      "gripper": 100.0
+    }
+  },
+  "pick_cup": {
+    "joints": {
+      "shoulder_pan": 72.08791208791209,
+      "shoulder_lift": -88.43956043956044,
+      "elbow_flex": -22.76923076923077,
+      "wrist_flex": -173.1868131868132,
+      "wrist_roll": 80.21978021978022,
+      "gripper": 100.0
+    },
+    "xy": [
+      0.17,
+      -0.04
+    ]
+  },
+  "place_cup": {
+    "joints": {
+      "shoulder_pan": 115.95604395604396,
+      "shoulder_lift": -88.52747252747253,
+      "elbow_flex": -11.428571428571429,
+      "wrist_flex": 176.26373626373626,
+      "wrist_roll": 79.34065934065934,
+      "gripper": 100.0
+    },
+    "xy": [
+      0.14,
+      -0.15
+    ]
+  },
+  "pick_medicine": {
+    "joints": {
+      "shoulder_pan": 115.25274725274726,
+      "shoulder_lift": -98.02197802197803,
+      "elbow_flex": -33.05494505494506,
+      "wrist_flex": 171.07692307692307,
+      "wrist_roll": 79.6043956043956,
+      "gripper": 100.0
+    },
+    "xy": [
+      0.24,
+      -0.08
+    ]
+  },
+  "place_medicine": {
+    "joints": {
+      "shoulder_pan": 93.71428571428571,
+      "shoulder_lift": -56.879120879120876,
+      "elbow_flex": -29.36263736263736,
+      "wrist_flex": -176.6153846153846,
+      "wrist_roll": 80.04395604395604,
+      "gripper": 100.0
+    },
+    "xy": [
+      0.19,
+      0.1
+    ]
+  }
+}
