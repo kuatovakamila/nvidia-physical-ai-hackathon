@@ -1,26 +1,37 @@
 # Within Reach
 
-**An accessible kitchen assistant for the SO-101 arm.** Ask for something you
-can't get to; the robot moves whatever is in the way, brings the item into your
-reach zone, and checks that it actually got there.
+**An assistive robotic system that brings everyday objects within reach.**
+
+Ask for an object you cannot safely or independently reach. The SO-101 arm
+identifies anything blocking the way, relocates those obstacles, delivers the
+requested object to an accessible reach zone, and verifies that it arrived
+successfully.
+
+Designed to support people with limited mobility, Within Reach connects
+perception, planning, and physical action beyond a scripted pick-and-place
+task. The current prototype is demonstrated in a kitchen-like environment,
+but the same system can be used anywhere someone may need help retrieving
+objects from a table, shelf, or shared workspace.
 
 ![Within Reach — live sim (Isaac Sim / SO-101)](assets/demo.gif)
 
-Built for the interX Physical AI Sprint hackathon. Runs in Isaac Sim through
-[Antioch](antioch.yaml), and on a physical SO-101 over USB with the same
-planner and the same phase machine.
+Built for the NVIDIA Physical AI Sprint Hackathon. It runs in Isaac Sim through
+[Antioch](antioch.yaml) and on a physical SO-101 over USB using the same planner
+and phase machine.
 
 ---
 
-## The idea
+## How it works
 
-The interesting part of a kitchen assistant is not the grasp — it is the moment
-the robot decides, on its own, to put the cup down somewhere else first.
+The challenging part of assistive object retrieval is not simply grasping an
+object. It is recognizing that the requested item is blocked, deciding how to
+clear a safe path, and recovering if an action fails.
 
-Nothing in the code says "move the cup." The planner is a LIFO goal stack: when
-the goal *deliver the medicine* turns out to be blocked, it pushes *relocate the
-blocker* on top of itself, executes that, and resumes. The cup-moving behaviour
-is emergent from three small algorithms:
+Nothing in the code explicitly says “move the cup.” The planner uses a LIFO
+goal stack. When the goal *deliver the medicine* is blocked, it pushes
+*relocate the blocker* onto the stack, completes that sub-goal, and then resumes
+the original delivery goal. The cup-moving behavior emerges from a small set
+of planning and monitoring components:
 
 | Piece | What it does | Where |
 |---|---|---|
