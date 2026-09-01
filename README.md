@@ -83,10 +83,10 @@ Reported per case: `success_rate`, `blocked_delivered`, `recovered`,
               ▼
         executor.py           approach → grasp → lift → carry → place
               │                 monitor.py checks physics after every phase
-              ├──────────────┬──────────────────┐
-              ▼              ▼                  ▼
-        SimBackend      RealBackend        FakeBackend
-        (Isaac)         (SO-101 / USB)     (pure Python)
+              ├──────────────┬──────────────────┬─────────────────┐
+              ▼              ▼                  ▼                 ▼
+        SimBackend      RealBackend        FakeBackend       ROS 2 node
+        (Isaac)         (SO-101 / USB)     (pure Python)     (rclpy topics)
 ```
 
 `executor.run_goal()` is the single seam between reasoning and action. The phase
@@ -95,6 +95,11 @@ grasp, lift, carry, place, check after each"* is a property of the task and not
 of the hardware. Only four primitives — `send`, `measured`, `state_for`,
 `dwell` — differ per backend. Same planner, same phases, same gates: one runs on
 a GPU in the cloud, one runs on the table in front of you.
+
+The ROS 2 package is a fourth consumer of that same seam rather than a port of
+anything. `ros2/src/within_reach/within_reach/bridge.py` holds the logic and
+imports no ROS at all, so it is testable on a machine with no ROS installed;
+`kitchen_node.py` is a thin rclpy wrapper over it.
 
 ## Running it
 
@@ -143,6 +148,28 @@ Two paths to the hardware, deliberately:
   targets. It needs the radians↔degrees correspondence established first,
   which is what `--map` is for.
 
+### ROS 2 node
+
+Drives `FakeBackend`, so no hardware or GPU is involved.
+
+```bash
+./ros2/run_in_docker.sh          # build, launch, send a command, print the topics
+```
+
+| direction | topic | type |
+|---|---|---|
+| sub | `/within_reach/command` | `std_msgs/String` |
+| pub | `/within_reach/plan` | `std_msgs/String` |
+| pub | `/within_reach/event` | `std_msgs/String` |
+| pub | `/joint_states` | `sensor_msgs/JointState` |
+
+`/joint_states` keeps its conventional name so `rviz2`, `rqt_plot` and
+`ros2 bag record` work without configuration. The logic alone, without ROS:
+
+```bash
+python3 ros2/src/within_reach/within_reach/bridge.py
+```
+
 ## Repo layout
 
 | File | |
@@ -158,6 +185,8 @@ Two paths to the hardware, deliberately:
 | `taught_arm.py` | Teach-and-replay executor; the safe hardware path. |
 | `calibrate_sweep.py` | Range-of-motion recorder that unwraps encoder rollover. |
 | `bus_monitor.py` | Live view of the half-duplex servo bus. |
+| `ros2/src/within_reach/` | ROS 2 package: `bridge.py` (no ROS imports, self-tested) and `kitchen_node.py` (rclpy). |
+| `ros2/run_in_docker.sh` | Builds and exercises the node in `ros:humble`, start to finish. |
 | `kitchen_suite.py` | Original pre-console scaffold, kept for history. `src/kitchen.py` superseded it. |
 | `RUNBOOK.md` | Launch runbook, roles, gates, known traps (Russian). |
 | `DESCRIPTION.md` | Why this task and not the other one (Russian). |
